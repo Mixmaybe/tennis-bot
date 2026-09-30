@@ -40,17 +40,17 @@ async def start(m: Message, state: FSMContext):
     await begin_registration(m, state)
 
 
-async def begin_registration(m: Message, state: FSMContext):
+async def begin_registration(m: Message, state: FSMContext, full_name: str | None = None):
     await state.set_state(Reg.name)
     await m.answer(
         "Привет! Это бот офисного настольного тенниса 🏓\n\n"
         "Здесь можно найти соперника, узнать, свободен ли стол, вести счёт и участвовать в турнире.\n\n"
         "Давай зарегистрируемся. <b>Как тебя зовут?</b> Напиши имя и фамилию, чтобы коллеги тебя узнали.",
-        reply_markup=reply_kb([m.from_user.full_name]),
+        reply_markup=reply_kb([full_name or m.from_user.full_name]),
     )
 
 
-@router.message(Reg.name, F.text)
+@router.message(Reg.name, F.text, ~F.text.in_(ui.MENU))
 async def reg_name(m: Message, state: FSMContext):
     name = m.text.strip()[:40]
     if len(name) < 2:
@@ -64,7 +64,7 @@ async def reg_name(m: Message, state: FSMContext):
                    reply_markup=reply_kb(depts) if depts else ReplyKeyboardRemove())
 
 
-@router.message(Reg.dept, F.text)
+@router.message(Reg.dept, F.text, ~F.text.in_(ui.MENU))
 async def reg_dept(m: Message, state: FSMContext):
     await state.update_data(dept=m.text.strip()[:40])
     await state.set_state(Reg.unit)
@@ -89,7 +89,7 @@ async def reg_unit(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(f"Сколько {logic.UNITS[unit][0]}? Напиши число.")
 
 
-@router.message(Reg.value, F.text)
+@router.message(Reg.value, F.text, ~F.text.in_(ui.MENU))
 async def reg_value(m: Message, state: FSMContext):
     if not m.text.strip().isdigit() or not 0 <= int(m.text) <= 3650:
         await m.answer("Напиши просто число, например <code>3</code>.")
@@ -193,7 +193,7 @@ async def profile(m: Message, state: FSMContext):
 @router.callback_query(F.data == "prof:edit")
 async def prof_edit(c: CallbackQuery, state: FSMContext):
     await c.answer()
-    await begin_registration(c.message, state)
+    await begin_registration(c.message, state, c.from_user.full_name)
 
 
 @router.callback_query(F.data == "prof:t")
