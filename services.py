@@ -26,6 +26,13 @@ async def add_to_tournament(bot: Bot, t: dict, uid: int, league: str):
     """Добавить игрока. Если турнир уже идёт — сразу создать ему матчи со всеми в лиге."""
     if await db.player_entry(t["id"], uid):
         return
+    if t["status"] == "running":
+        # лигу могли слить с соседней при старте — берём ближайшую существующую
+        existing = {r["league"] for r in await db.q(
+            "SELECT DISTINCT league FROM tournament_players WHERE tournament_id=?", t["id"])}
+        if existing and league not in existing:
+            order = [code for code, _, _ in logic.LEAGUES]
+            league = min(existing, key=lambda c: abs(order.index(c) - order.index(league)))
     await db.ex("INSERT INTO tournament_players VALUES (?,?,?)", t["id"], uid, league)
     if t["status"] != "running":
         return
