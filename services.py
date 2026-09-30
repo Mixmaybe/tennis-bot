@@ -239,10 +239,11 @@ async def ask_referee(bot: Bot, mid: int, ref_id: int):
 
 async def can_confirm(m: dict, uid: int) -> bool:
     u = await db.user(uid)
+    if m["tournament_id"]:
+        # свой турнирный матч не может подтвердить даже админ
+        return uid not in (m["p1"], m["p2"]) and (db.is_admin(u) or m["referee_id"] == uid)
     if db.is_admin(u):
         return True
-    if m["tournament_id"]:
-        return m["referee_id"] == uid and uid not in (m["p1"], m["p2"])
     return uid in (m["p1"], m["p2"]) and uid != m["reported_by"]
 
 
