@@ -47,6 +47,17 @@ A Telegram bot for table tennis in the office. People can find someone to play w
 
 The bot uses long polling, so it needs no public URL. It works only while the process is running. Data is stored in SQLite (`tennis.db`), and copying that file is enough for a backup.
 
+### Autostart on Windows
+
+Run `install_autostart.cmd` once. It adds the bot to the current user's Startup folder (no admin rights needed) and starts it right away, with no console window.
+
+- `start_bot.cmd` restarts the bot 10 seconds after a crash.
+- Only one copy can run at a time: a second launch exits on its own (it holds a local port, `LOCK_PORT`, default `47231`).
+- The log is written to `logs/bot.log` and rotated at 1 MB, keeping 3 files. Crashes are logged there too.
+- To stop autostart, run `uninstall_autostart.cmd`. To stop the running bot, end `python.exe` in Task Manager.
+
+If the laptop sleeps, the bot stops responding, so disable sleep while plugged in and set "When I close the lid" to "Do nothing" (`control powercfg.cpl`).
+
 ### Commands
 
 | Command | Who | What |
@@ -69,8 +80,9 @@ The bot uses long polling, so it needs no public URL. It works only while the pr
 ### Project structure
 
 ```
-bot.py            entry point, routers, background ticker (queue, stale matches)
+bot.py            entry point, routers, background ticker (queue, stale matches), single instance, log file
 config.py         settings from .env
+start_bot.cmd, start_hidden.vbs, install_autostart.cmd, uninstall_autostart.cmd   Windows autostart
 db.py             SQLite schema, migrations, queries
 logic.py          pure logic: seeding, leagues, score validation, live replay, ITTF standings
 services.py       shared operations: tournament, tables & queue, results & confirmation
@@ -121,6 +133,17 @@ Telegram-бот для настольного тенниса в офисе. С �
 
 Бот работает через long polling, поэтому публичный адрес ему не нужен. Он работает, только пока запущен процесс. Данные хранятся в SQLite (`tennis.db`): для резервной копии достаточно скопировать этот файл.
 
+### Автозапуск в Windows
+
+Один раз запустите `install_autostart.cmd`. Он добавит бота в «Автозагрузку» текущего пользователя (права администратора не нужны) и сразу запустит его без окна консоли.
+
+- `start_bot.cmd` перезапускает бота через 10 секунд после падения.
+- Одновременно работает только одна копия: повторный запуск сам завершается (бот занимает локальный порт `LOCK_PORT`, по умолчанию `47231`).
+- Журнал пишется в `logs/bot.log` с ротацией по 1 МБ, хранятся 3 файла. Падения тоже записываются туда.
+- Чтобы убрать автозапуск, запустите `uninstall_autostart.cmd`. Чтобы остановить работающего бота, завершите `python.exe` в диспетчере задач.
+
+Если ноутбук уснёт, бот перестанет отвечать. Поэтому отключите сон при работе от сети и поставьте «При закрытии крышки: действие не требуется» (`control powercfg.cpl`).
+
 ### Команды
 
 | Команда | Кто | Что делает |
@@ -143,8 +166,9 @@ Telegram-бот для настольного тенниса в офисе. С �
 ### Структура проекта
 
 ```
-bot.py            точка входа, роутеры, фоновая проверка (очередь, брошенные матчи)
+bot.py            точка входа, роутеры, фоновая проверка (очередь, брошенные матчи), одна копия, журнал
 config.py         настройки из .env
+start_bot.cmd, start_hidden.vbs, install_autostart.cmd, uninstall_autostart.cmd   автозапуск в Windows
 db.py             схема SQLite, миграции, запросы
 logic.py          чистая логика: посев, лиги, проверка счёта, живой счёт, таблица ITTF
 services.py       общие операции: турнир, столы и очередь, результаты и подтверждение

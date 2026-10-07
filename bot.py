@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import os
+import socket
+import sys
+from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -23,8 +27,31 @@ async def ticker(bot: Bot):
         await asyncio.sleep(10)
 
 
+ALREADY_RUNNING = 3  # код выхода, по которому start_bot.cmd понимает, что перезапускать не нужно
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+def single_instance() -> socket.socket:
+    """Два бота с одним токеном мешают друг другу — второй экземпляр сразу выходит."""
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", config.LOCK_PORT))
+    except OSError:
+        print("Бот уже запущен", file=sys.stderr)
+        raise SystemExit(ALREADY_RUNNING)
+    return lock
+
+
+def setup_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handlers = [RotatingFileHandler(os.path.join(LOG_DIR, "bot.log"), maxBytes=1_000_000, backupCount=3,
+                                    encoding="utf-8")]
+    if sys.stderr and sys.stderr.isatty():  # запуск из консоли — дублируем журнал на экран
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+
+
 async def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not config.BOT_TOKEN:
         raise SystemExit("Заполни BOT_TOKEN в файле .env (токен от @BotFather)")
     await db.init(config.DB_PATH)
@@ -48,4 +75,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _lock = single_instance()
+    setup_logging()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except BaseException:
+        logging.exception("Бот упал, start_bot.cmd перезапустит его через 10 секунд")
+        raise
