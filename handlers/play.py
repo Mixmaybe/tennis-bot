@@ -123,20 +123,63 @@ async def invite(c: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.regexp(r"^inv[ald]:"))
 async def invite_answer(c: CallbackQuery, bot: Bot):
     kind, inviter = c.data.split(":")
+    inviter = int(inviter)
     me = await db.user(c.from_user.id)
     answers = {
-        "inva": ("✅ <b>{n}</b> принял(а) приглашение и идёт к столу!", "Отлично, удачной игры! 🏓"),
-        "invl": ("⏰ <b>{n}</b> сможет чуть позже.", "Ок, сообщил."),
-        "invd": ("❌ <b>{n}</b> сейчас не может.", "Ок, сообщил."),
+        "inva": "✅ <b>{n}</b> принял(а) приглашение!",
+        "invl": "⏰ <b>{n}</b> сможет чуть позже.",
+        "invd": "❌ <b>{n}</b> сейчас не может.",
     }
-    to_inviter, to_me = answers[kind]
-    await services.notify(bot, int(inviter), to_inviter.format(n=name(me)))
-    if kind == "inva":
-        await db.ex("UPDATE users SET status=NULL, ready_at=NULL, status_until=NULL WHERE tg_id IN (?,?)",
-                    me["tg_id"], int(inviter))
-        to_me += f"\nНе забудь «{ui.B_LIVE}», чтобы стол отметился занятым."
     await c.answer()
-    await c.message.edit_text(c.message.html_text + f"\n\n{to_me}")
+    if kind != "inva":
+        await services.notify(bot, inviter, answers[kind].format(n=name(me)))
+        await c.message.edit_text(c.message.html_text + "\n\nОк, сообщил.")
+        return
+    await db.ex("UPDATE users SET status=NULL, ready_at=NULL, status_until=NULL WHERE tg_id IN (?,?)",
+                me["tg_id"], inviter)
+    await c.message.edit_text(c.message.html_text + "\n\nОтлично, удачной игры! 🏓")
+    # пара нашлась: стол свободен — предлагаем бронь, занят — сразу ставим в очередь
+    res, val = await services.request_table(inviter, me["tg_id"], book=False)
+    text, kb = await services.table_result_text(res, val, inviter, me["tg_id"])
+    await services.notify(bot, inviter, answers["inva"].format(n=name(me)) + "\n\n" + text, kb)
+    await c.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("bk:"))
+async def book(c: CallbackQuery, bot: Bot):
+    _, a, b = c.data.split(":")
+    a, b = int(a), int(b)
+    res, val = await services.request_table(a, b, book=True)
+    text, kb = await services.table_result_text(res, val, a, b)
+    await c.answer("Стол ваш!" if res == "booked" else "Уже ваш" if res == "own" else "Стол успели занять — вы в очереди")
+    await c.message.edit_text(text, reply_markup=kb)
+    if res in ("booked", "queued"):
+        other = b if c.from_user.id == a else a
+        await services.notify(bot, other, text, kb)
+
+
+@router.callback_query(F.data.startswith("bkx:"))
+async def unbook(c: CallbackQuery, bot: Bot):
+    _, a, b = c.data.split(":")
+    tb = await services.pair_table(int(a), int(b))
+    if tb and not tb["match_id"]:
+        await services.free_table(tb["table_no"], bot=bot)
+        other = int(b) if c.from_user.id == int(a) else int(a)
+        await services.notify(bot, other, f"❌ {name(await db.user(c.from_user.id))} снял(а) бронь стола.")
+    await c.answer("Бронь снята")
+    await c.message.edit_text("Бронь снята, стол отдан следующим.")
+
+
+@router.callback_query(F.data.startswith("qx:"))
+async def leave_queue(c: CallbackQuery, bot: Bot):
+    qid = int(c.data.split(":")[1])
+    e = await db.q1("SELECT * FROM table_queue WHERE id=?", qid)
+    await db.ex("UPDATE table_queue SET status='left' WHERE id=? AND status='waiting'", qid)
+    await c.answer("Вы вышли из очереди")
+    await c.message.edit_text("🚪 Вы вышли из очереди к столу.")
+    if e:
+        other = e["p2"] if c.from_user.id == e["p1"] else e["p1"]
+        await services.notify(bot, other, f"🚪 {name(await db.user(c.from_user.id))} убрал(а) вашу пару из очереди.")
 
 
 # ---------- стол ----------
@@ -150,14 +193,22 @@ async def table_cmd(m: Message, state: FSMContext):
 
 async def show_tables(m: Message, uid: int, edit: bool = False):
     rows = []
+    has_queue = bool(await services.queue())
     for tb in await services.tables():
         suffix = f" {tb['table_no']}" if config.TABLES > 1 else ""
-        if not tb["busy"]:
+        if not tb["busy"] and not has_queue:
             rows.append([(f"Занять{suffix} на 15 мин", f"tb:{tb['table_no']}:15"),
-                         (f"на 30 мин", f"tb:{tb['table_no']}:30")])
-        elif tb["busy_by"] == uid or db.is_admin(await db.user(uid)):
+                         ("на 30 мин", f"tb:{tb['table_no']}:30")])
+        elif tb["busy"] and not tb["match_id"] and (uid in (tb["busy_by"], tb["busy_with"])
+                                                     or db.is_admin(await db.user(uid))):
             rows.append([(f"🟢 Освободить стол{suffix}", f"tb:{tb['table_no']}:0")])
+    live_n = len(await db.matches("status='live'"))
+    if live_n:
+        rows.append([(f"👀 Смотреть матч со счётом ({live_n})", "lwl")])
+    rows.append([("👨‍⚖️ Судить игру", "lref")])
     text = await services.tables_text()
+    if has_queue:
+        text += "\n\nЧтобы встать в очередь, пригласи соперника в «👥 Кто готов» — пара встанет в очередь сама."
     ready = sum(1 for u in await db.users() if u["tg_id"] != uid and ui.status(u)[0])
     if ready:
         text += f"\n\n👥 Готовы играть: {ready} чел. — «{ui.B_WHO}»"
@@ -168,17 +219,22 @@ async def show_tables(m: Message, uid: int, edit: bool = False):
 
 
 @router.callback_query(F.data.startswith("tb:"))
-async def table_action(c: CallbackQuery):
+async def table_action(c: CallbackQuery, bot: Bot):
     _, no, minutes = c.data.split(":")
     no, minutes = int(no), int(minutes)
     u = await db.user(c.from_user.id)
-    tb = next((t for t in await services.tables() if t["table_no"] == no), None)
     if minutes == 0:
-        await services.free_table(no)
+        await services.free_table(no, bot=bot)
         await c.answer("Стол свободен")
-    elif tb and tb["busy"]:
-        await c.answer("Стол уже заняли 😕", show_alert=True)
     else:
-        await services.occupy(no, u["tg_id"], minutes, f"{u['name']} играет")
-        await c.answer(f"Стол занят на {minutes} мин")
-    await show_tables(c.message, c.from_user.id, edit=True)
+        async with services.LOCK:
+            tb = next((t for t in await services.tables() if t["table_no"] == no), None)
+            ok = tb and not tb["busy"] and not await services.queue()
+            if ok:
+                await services.occupy(no, u["tg_id"], minutes, f"{u['name']} играет")
+        await c.answer(f"Стол занят на {minutes} мин" if ok else "Стол уже заняли или есть очередь 😕",
+                       show_alert=not ok)
+    try:
+        await show_tables(c.message, c.from_user.id, edit=True)
+    except Exception:
+        pass

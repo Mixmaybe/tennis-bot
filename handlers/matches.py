@@ -9,6 +9,7 @@ import db
 import logic
 import services
 import ui
+from handlers import live
 from ui import ikb, name
 
 router = Router()
@@ -44,7 +45,13 @@ async def choose_match(m: Message, uid: int, purpose: str):
     rows = [[(f"🏆 #{mt['id']} vs {opp['name']}", f"pick:{purpose}:t:{mt['id']}")]
             for mt, opp in (await services.next_matches(uid))[:8]]
     rows.append([("🤝 Дружеская игра", f"pick:{purpose}:f")])
-    title = "▶️ <b>Ведём счёт.</b> С кем играешь?" if purpose == "live" else "✍️ <b>Внести результат.</b> Какой матч?"
+    if purpose == "live":
+        rows.append([("👨‍⚖️ Судить игру других", "lref")])
+        n = len(await db.matches("status='live'"))
+        if n:
+            rows.append([(f"👀 Смотреть идущие матчи ({n})", "lwl")])
+    title = ("▶️ <b>Ведём счёт.</b> С кем играешь?\n\n"
+                                         "Или стань судьёй чужой игры — игроки увидят счёт в реальном времени.") if purpose == "live" else "✍️ <b>Внести результат.</b> Какой матч?"
     await m.answer(title, reply_markup=ikb(rows))
 
 
@@ -71,6 +78,10 @@ async def pick(c: CallbackQuery, state: FSMContext):
     if kind == "f":
         await opponent_menu(c.message, uid, purpose, state)
         return
+    if kind == "u" and purpose == "live":
+        await state.clear()
+        await live.setup_pair(c.message, uid, int(parts[3]))
+        return
     if kind == "u":  # выбран соперник для дружеской игры
         opp = int(parts[3])
         mid = await db.ex("INSERT INTO matches(tournament_id, p1, p2, status, best_of, created_at) "
@@ -82,16 +93,18 @@ async def pick(c: CallbackQuery, state: FSMContext):
             await c.message.answer("Этот матч уже сыгран или идёт.")
             return
     if purpose == "live":
-        await ask_server(c.message, mid, uid)
+        await live.ask_server(c.message, mid)
     else:
         await state.set_state(S.scores)
         await state.update_data(mid=mid)
         mt = await db.match(mid)
         opp = await db.user(mt["p2"] if mt["p1"] == uid else mt["p1"])
         need = logic.need_wins(mt["best_of"])
+        fmt = (f"Турнирный матч — до {need} побед в партиях." if mt["tournament_id"]
+               else "Можно одну партию или матч до 2 побед.")
         await c.message.answer(
             f"Напиши счёт каждой партии против <b>{name(opp)}</b> — <b>сначала твои очки</b>.\n"
-            f"Матч до {need} побед в партиях. Например:\n<code>11:7 9:11 11:5</code>")
+            f"{fmt} Например:\n<code>11:7 9:11 11:5</code> или <code>11:8</code>")
 
 
 async def opponent_menu(m: Message, uid: int, purpose: str, state: FSMContext):
@@ -103,125 +116,15 @@ async def opponent_menu(m: Message, uid: int, purpose: str, state: FSMContext):
                    reply_markup=ikb(rows) if rows else None)
 
 
-async def search_users(text: str, exclude: set[int]) -> list[dict]:
-    q = text.strip().lower().lstrip("@")
-    return [u for u in await db.users() if u["tg_id"] not in exclude
-            and (q in u["name"].lower() or q in (u["username"] or "").lower())][:10]
-
-
 @router.message(S.find_opp, F.text, ~F.text.in_(ui.MENU))
 async def find_opp(m: Message, state: FSMContext):
     purpose = (await state.get_data())["purpose"]
-    found = await search_users(m.text, {m.chat.id})
+    found = await services.search_users(m.text, {m.chat.id})
     if not found:
         await m.answer("Никого не нашёл 🤷 Попробуй иначе. Соперник должен быть зарегистрирован в боте (/qr).")
         return
     await m.answer("Кого из них?", reply_markup=ikb(
         [[(f"{u['name']} · {u['department']}", f"pick:{purpose}:u:{u['tg_id']}")] for u in found]))
-
-
-# ---------- живой счёт ----------
-
-async def ask_server(m: Message, mid: int, uid: int):
-    mt = await db.match(mid)
-    users = await services.umap()
-    await m.answer("🏓 Кто подаёт первым? (разыграйте подачу)", reply_markup=ikb([
-        [(users[mt["p1"]]["name"], f"srv:{mid}:0"), (users[mt["p2"]]["name"], f"srv:{mid}:1")]]))
-
-
-@router.callback_query(F.data.startswith("srv:"))
-async def live_start(c: CallbackQuery):
-    _, mid, fs = c.data.split(":")
-    mid = int(mid)
-    mt = await db.match(mid)
-    if mt["status"] not in ("scheduled", "setup"):
-        await c.answer("Матч уже идёт или сыгран", show_alert=True)
-        return
-    await db.ex("UPDATE matches SET status='live' WHERE id=?", mid)
-    await db.set_live(mid, {"fs": int(fs), "pts": []})
-    users = await services.umap()
-    table = await services.occupy_free_table(
-        c.from_user.id, 40, f"{users[mt['p1']]['name']} — {users[mt['p2']]['name']}", mid)
-    await c.answer()
-    note = f"Стол {table} отмечен занятым ✅" if table and config.TABLES > 1 else \
-        "Стол отмечен занятым ✅" if table else "⚠️ Все столы отмечены занятыми, но счёт ведём."
-    await c.message.edit_text(note)
-    text, kb = await live_view(mid)
-    await c.message.answer(text, reply_markup=kb)
-
-
-async def live_view(mid: int):
-    mt = await db.match(mid)
-    users = await services.umap()
-    live = mt["live"]
-    games, cur = logic.replay(live["pts"])
-    n1, n2 = users[mt["p1"]]["name"], users[mt["p2"]]["name"]
-    need = logic.need_wins(mt["best_of"])
-    gw = [sum(1 for a, b in games if a > b), sum(1 for a, b in games if b > a)]
-    winner = logic.games_winner(games, mt["best_of"])
-    w = max(len(n1), len(n2), 5)
-    kind = "🏆 Турнир" if mt["tournament_id"] else "🤝 Дружеская"
-    head = f"{kind} · до {need} побед\n"
-    if games:
-        head += "Партии: " + ", ".join(f"{a}:{b}" for a, b in games) + "\n"
-    if winner is not None:
-        board = f"{n1:<{w}}  {gw[0]}\n{n2:<{w}}  {gw[1]}"
-        text = head + f"<pre>{ui.esc(board)}</pre>\n🏁 <b>Матч окончен!</b> Победил(а) <b>{ui.esc([n1, n2][winner])}</b>"
-        return text, ikb([[("✅ Отправить результат", f"lv:done:{mid}")],
-                          [("↩️ Отменить последнее очко", f"lv:undo:{mid}")]])
-    srv = logic.server(live["fs"], len(games), cur)
-    ball = [" 🏓" if srv == 0 else "", " 🏓" if srv == 1 else ""]
-    board = (f"{'':<{w}}  П  Очки\n"
-             f"{n1:<{w}}  {gw[0]}  {cur[0]:>2}{ball[0]}\n"
-             f"{n2:<{w}}  {gw[1]}  {cur[1]:>2}{ball[1]}")
-    text = head + f"Партия №{len(games) + 1}\n<pre>{ui.esc(board)}</pre>\n🏓 — подаёт"
-    return text, ikb([
-        [(f"+1 {n1}", f"lv:0:{mid}"), (f"+1 {n2}", f"lv:1:{mid}")],
-        [("↩️ Отменить", f"lv:undo:{mid}"), ("⏹ Прервать", f"lv:stop:{mid}")],
-    ])
-
-
-@router.callback_query(F.data.startswith("lv:"))
-async def live_action(c: CallbackQuery, bot: Bot):
-    _, act, mid = c.data.split(":")
-    mid = int(mid)
-    mt = await db.match(mid)
-    if not mt or mt["status"] != "live":
-        await c.answer("Матч уже не идёт", show_alert=True)
-        return
-    live = mt["live"]
-    if act in ("0", "1"):
-        games, _ = logic.replay(live["pts"])
-        if logic.games_winner(games, mt["best_of"]) is not None:
-            await c.answer("Матч уже окончен")
-            return
-        live["pts"].append(int(act))
-    elif act == "undo":
-        if not live["pts"]:
-            await c.answer("Нечего отменять")
-            return
-        live["pts"].pop()
-    elif act == "stop":
-        await services.free_table(match_id=mid)
-        if mt["tournament_id"]:
-            await db.ex("UPDATE matches SET status='scheduled', live=NULL WHERE id=?", mid)
-        else:
-            await db.ex("DELETE FROM matches WHERE id=?", mid)
-        await c.answer()
-        await c.message.edit_text("⏹ Матч прерван, счёт не сохранён. Стол освобождён.")
-        return
-    elif act == "done":
-        games, _ = logic.replay(live["pts"])
-        text, kb = await services.submit_result(bot, mid, games, c.from_user.id)
-        await c.answer()
-        await c.message.edit_text(text, reply_markup=kb)
-        return
-    await db.set_live(mid, live)
-    # продлеваем занятость стола, пока идёт счёт
-    await db.ex("UPDATE tables SET busy_until=? WHERE match_id=?", db.now() + 20 * 60, mid)
-    text, kb = await live_view(mid)
-    await c.answer()
-    await c.message.edit_text(text, reply_markup=kb)
 
 
 # ---------- ручной ввод счёта ----------
@@ -235,6 +138,11 @@ async def enter_scores(m: Message, state: FSMContext, bot: Bot):
         await m.answer("Этот матч уже сыгран.")
         return
     games = logic.parse_scores(m.text)
+    if not mt["tournament_id"]:
+        best_of = 1 if len(games) == 1 else 3
+        if best_of != mt["best_of"]:
+            await db.ex("UPDATE matches SET best_of=? WHERE id=?", best_of, mid)
+            mt["best_of"] = best_of
     err = logic.match_error(games, mt["best_of"])
     if err:
         await m.answer(f"⚠️ {err}\n\nНапиши ещё раз, сначала твои очки: <code>11:7 9:11 11:5</code>")
@@ -273,7 +181,7 @@ async def ref_search(c: CallbackQuery, state: FSMContext):
 async def find_ref(m: Message, state: FSMContext):
     mid = (await state.get_data())["mid"]
     mt = await db.match(mid)
-    found = await search_users(m.text, {mt["p1"], mt["p2"]})
+    found = await services.search_users(m.text, {mt["p1"], mt["p2"]})
     if not found:
         await m.answer("Никого не нашёл. Судья тоже должен быть зарегистрирован в боте.")
         return
@@ -291,14 +199,24 @@ async def confirm_or_reject(c: CallbackQuery, bot: Bot):
         await c.answer("Этот результат уже обработан", show_alert=True)
         await c.message.edit_reply_markup(reply_markup=None)
         return
-    if not await services.can_confirm(mt, c.from_user.id):
-        await c.answer("Подтвердить может только судья матча или админ", show_alert=True)
+    uid = c.from_user.id
+    if not await services.can_confirm(mt, uid):
+        if mt["need_players"] and uid in (mt["p1"], mt["p2"]):
+            msg = "Ты уже подтвердил(а), ждём соперника"
+        elif mt["need_players"]:
+            msg = "Подтвердить могут только игроки этого матча"
+        else:
+            msg = "Подтвердить может только судья матча или админ"
+        await c.answer(msg, show_alert=True)
         return
-    if act == "cf":
-        await services.confirm(bot, mt, c.from_user.id)
+    if act == "cf" and mt["need_players"] and uid in (mt["p1"], mt["p2"]):
+        both = await services.player_confirm(bot, mt, uid)
+        mark = "✅ Подтверждено" if both else "✅ Ты подтвердил(а), ждём соперника"
+    elif act == "cf":
+        await services.confirm(bot, mt, uid)
         mark = "✅ Подтверждено"
     else:
-        await services.reject(bot, mt, c.from_user.id)
+        await services.reject(bot, mt, uid)
         mark = "❌ Отклонено"
     await c.answer(mark)
     await c.message.edit_text(c.message.html_text + f"\n\n<b>{mark}</b>")

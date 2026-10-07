@@ -57,6 +57,21 @@ CREATE TABLE IF NOT EXISTS matches(
     created_at INTEGER,
     played_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS table_queue(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    p1 INTEGER,
+    p2 INTEGER,
+    status TEXT,              -- waiting | called | left | expired
+    created_at INTEGER,
+    called_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS live_views(
+    match_id INTEGER,
+    chat_id INTEGER,
+    message_id INTEGER,
+    mode TEXT,                -- ctl (ведёт счёт) | watch (смотрит)
+    PRIMARY KEY(match_id, chat_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS tables(
     table_no INTEGER PRIMARY KEY,
     busy_by INTEGER,
@@ -77,12 +92,19 @@ async def init(path: str):
     DB.row_factory = aiosqlite.Row
     await DB.executescript(SCHEMA)
     # миграции: новые колонки для старых баз
-    async with DB.execute("PRAGMA table_info(users)") as cur:
-        cols = {r[1] for r in await cur.fetchall()}
-    for col, ddl in [("verified", "INTEGER DEFAULT 0"),  # 0 нет, 1 подтверждён, -1 отклонён, 2 на проверке
-                     ("verify_photo", "TEXT"), ("verify_kind", "TEXT")]:
-        if col not in cols:
-            await DB.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+    migrations = {
+        "users": [("verified", "INTEGER DEFAULT 0"),  # 0 нет, 1 подтверждён, -1 отклонён, 2 на проверке
+                  ("verify_photo", "TEXT"), ("verify_kind", "TEXT")],
+        "tables": [("busy_with", "INTEGER")],  # второй игрок брони
+        "matches": [("need_players", "INTEGER DEFAULT 0"),  # 1 = счёт вёл судья, подтверждают оба игрока
+                    ("confirms", "TEXT"), ("scorer", "INTEGER")],
+    }
+    for table, columns in migrations.items():
+        async with DB.execute(f"PRAGMA table_info({table})") as cur:
+            cols = {r[1] for r in await cur.fetchall()}
+        for col, ddl in columns:
+            if col not in cols:
+                await DB.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     for n in range(1, config.TABLES + 1):
         await DB.execute("INSERT OR IGNORE INTO tables(table_no) VALUES (?)", (n,))
     await DB.commit()

@@ -8,7 +8,18 @@ from aiogram.types import BotCommand
 
 import config
 import db
-from handlers import guide, matches, play, reg, tourney
+import services
+from handlers import guide, live, matches, play, reg, tourney
+
+
+async def ticker(bot: Bot):
+    """Сгоревшие брони стола передаются следующей паре из очереди."""
+    while True:
+        try:
+            await services.housekeeping(bot)
+        except Exception:
+            logging.exception("housekeeping")
+        await asyncio.sleep(10)
 
 
 async def main():
@@ -21,7 +32,7 @@ async def main():
 
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_routers(reg.router, guide.router, play.router, matches.router, tourney.router)
+    dp.include_routers(reg.router, guide.router, play.router, live.router, matches.router, tourney.router)
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать / главное меню"),
         BotCommand(command="help", description="Инструкция: как играть, вести счёт, турнир"),
@@ -31,6 +42,7 @@ async def main():
     ])
     me = await bot.get_me()
     logging.info("Бот @%s запущен", me.username)
+    asyncio.create_task(ticker(bot))
     await dp.start_polling(bot)
 
 

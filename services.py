@@ -1,4 +1,6 @@
 """Операции, которые используют несколько обработчиков."""
+import asyncio
+import json
 import logging
 
 from aiogram import Bot
@@ -149,7 +151,15 @@ async def my_matches_text(uid: int) -> str:
     return "\n".join(parts) or "Пока нет матчей. Поставь статус «готов играть» или вступи в турнир в профиле."
 
 
-# ---------- столы ----------
+# ---------- столы и очередь ----------
+
+# Все операции бронирования идут через один замок: кто первый нажал — тому стол,
+# следующий (даже на долю секунды позже) попадает в очередь.
+LOCK = asyncio.Lock()
+BOOK_MIN = 10        # бронь стола для пары
+LIVE_MIN = 20        # стол держится за матчем, пока ведут счёт (продлевается каждым очком)
+QUEUE_TTL = 90 * 60  # заявка в очереди сгорает через 1,5 часа
+
 
 async def tables() -> list[dict]:
     rows = await db.q("SELECT * FROM tables ORDER BY table_no")
@@ -158,24 +168,142 @@ async def tables() -> list[dict]:
     return rows
 
 
-async def occupy_free_table(uid: int, minutes: int, note: str, match_id: int | None = None) -> int | None:
+async def occupy(table_no: int, uid: int, minutes: int, note: str, match_id: int | None = None,
+                 with_uid: int | None = None):
+    await db.ex("UPDATE tables SET busy_by=?, busy_with=?, note=?, match_id=?, busy_until=? WHERE table_no=?",
+                uid, with_uid, note, match_id, db.now() + minutes * 60, table_no)
+
+
+async def free_table(table_no: int | None = None, match_id: int | None = None, bot: Bot | None = None):
+    where, arg = ("match_id=?", match_id) if match_id is not None else ("table_no=?", table_no)
+    await db.ex(f"UPDATE tables SET busy_by=NULL, busy_with=NULL, note=NULL, match_id=NULL, busy_until=NULL "
+                f"WHERE {where}", arg)
+    if bot:
+        await advance_queue(bot)
+
+
+def pair_label(users: dict, a: int, b: int) -> str:
+    return f"{users[a]['name'] if a in users else '?'} — {users[b]['name'] if b in users else '?'}"
+
+
+async def pair_table(a: int, b: int) -> dict | None:
+    """Стол, который сейчас держит эта пара (бронь или матч)."""
     for tb in await tables():
-        if not tb["busy"]:
-            await occupy(tb["table_no"], uid, minutes, note, match_id)
-            return tb["table_no"]
+        if tb["busy"] and {tb["busy_by"], tb["busy_with"]} & {a, b} - {None}:
+            return tb
     return None
 
 
-async def occupy(table_no: int, uid: int, minutes: int, note: str, match_id: int | None = None):
-    await db.ex("UPDATE tables SET busy_by=?, note=?, match_id=?, busy_until=? WHERE table_no=?",
-                uid, note, match_id, db.now() + minutes * 60, table_no)
+async def queue() -> list[dict]:
+    return await db.q("SELECT * FROM table_queue WHERE status='waiting' ORDER BY id")
 
 
-async def free_table(table_no: int | None = None, match_id: int | None = None):
-    if match_id is not None:
-        await db.ex("UPDATE tables SET busy_by=NULL, note=NULL, match_id=NULL, busy_until=NULL WHERE match_id=?", match_id)
-    else:
-        await db.ex("UPDATE tables SET busy_by=NULL, note=NULL, match_id=NULL, busy_until=NULL WHERE table_no=?", table_no)
+async def queue_entry(a: int, b: int) -> tuple[dict, int] | tuple[None, None]:
+    for i, e in enumerate(await queue(), 1):
+        if {e["p1"], e["p2"]} & {a, b}:
+            return e, i
+    return None, None
+
+
+async def request_table(a: int, b: int, book: bool) -> tuple[str, dict | int | None]:
+    """
+    Пара нашла друг друга. Возвращает:
+      ('own', стол)    — у пары уже есть стол;
+      ('free', None)   — стол свободен (если book=False — только сообщаем);
+      ('booked', стол) — забронировали на 10 минут;
+      ('queued', №)    — стол занят или есть очередь: пара в очереди под этим номером.
+    """
+    async with LOCK:
+        tb = await pair_table(a, b)
+        if tb:
+            return "own", tb
+        e, pos = await queue_entry(a, b)
+        if e:
+            return "queued", pos
+        q = await queue()
+        free = [t for t in await tables() if not t["busy"]]
+        if free and not q:
+            if not book:
+                return "free", None
+            users = await umap()
+            await occupy(free[0]["table_no"], a, BOOK_MIN, pair_label(users, a, b) + " (бронь)", None, b)
+            return "booked", free[0]
+        await db.ex("INSERT INTO table_queue(p1, p2, status, created_at) VALUES (?, ?, 'waiting', ?)", a, b, db.now())
+        return "queued", len(q) + 1
+
+
+async def playing_now_text(users: dict | None = None) -> str:
+    users = users or await umap()
+    lines = []
+    for tb in await tables():
+        if not tb["busy"]:
+            continue
+        who = pair_label(users, tb["busy_by"], tb["busy_with"]) if tb["busy_with"] else \
+            (tb["note"] or name(users.get(tb["busy_by"])))
+        score = ""
+        if tb["match_id"]:
+            m = await db.match(tb["match_id"])
+            if m and m["live"]:
+                games, cur = logic.replay(m["live"]["pts"])
+                score = f", счёт {ui.games_score(games)} (партия {cur[0]}:{cur[1]})"
+        what = "играют" if tb["match_id"] else "забронировали"
+        lines.append(f"{what}: <b>{ui.esc(who)}</b>{score}, ещё ~{ui.dur(tb['busy_until'] - db.now())}")
+    return "\n".join(lines) or "никого"
+
+
+def queue_kb(entry_id: int):
+    return ikb([[("🚪 Выйти из очереди", f"qx:{entry_id}")]])
+
+
+async def table_result_text(kind: str, val, a: int, b: int) -> tuple[str, object]:
+    """Текст и кнопки для пары по результату request_table."""
+    users = await umap()
+    if kind in ("booked", "own"):
+        label = f" {val['table_no']}" if len(await tables()) > 1 else ""
+        left = ui.dur(val["busy_until"] - db.now()) if kind == "own" else f"{BOOK_MIN} мин"
+        return (f"✅ Стол{label} забронирован за вами (<b>{ui.esc(pair_label(users, a, b))}</b>) — {left}.\n"
+                "Подходите! Начните «Вести счёт», и стол будет держаться за вами всю игру. "
+                "Если не подойдёте — бронь сгорит и стол уйдёт следующим.",
+                ikb([[("▶️ Начать матч и вести счёт", f"lp:{a}:{b}")], [("❌ Снять бронь", f"bkx:{a}:{b}")]]))
+    if kind == "free":
+        return ("🟢 <b>Стол сейчас свободен!</b> Забронировать его за вами на 10 минут?",
+                ikb([[("🟢 Забронировать на 10 минут", f"bk:{a}:{b}")]]))
+    e, pos = await queue_entry(a, b)
+    return (f"⏳ <b>Стол занят — вы в очереди №{pos}.</b>\n"
+            f"Сейчас за столом {await playing_now_text(users)}.\n\n"
+            "Как только стол освободится, бот сразу позовёт вас и забронирует стол на 10 минут.",
+            queue_kb(e["id"]) if e else None)
+
+
+async def advance_queue(bot: Bot):
+    """Отдать свободные столы следующим парам из очереди."""
+    called = []
+    async with LOCK:
+        await db.ex("UPDATE table_queue SET status='expired' WHERE status='waiting' AND created_at < ?",
+                    db.now() - QUEUE_TTL)
+        users = await umap()
+        for tb in await tables():
+            if tb["busy"]:
+                continue
+            q = await queue()
+            if not q:
+                break
+            e = q[0]
+            await occupy(tb["table_no"], e["p1"], BOOK_MIN, pair_label(users, e["p1"], e["p2"]) + " (бронь)",
+                         None, e["p2"])
+            await db.ex("UPDATE table_queue SET status='called', called_at=? WHERE id=?", db.now(), e["id"])
+            called.append(e)
+    if not called:
+        return
+    for e in called:
+        tb = await pair_table(e["p1"], e["p2"])
+        text, kb = await table_result_text("booked", tb, e["p1"], e["p2"])
+        for uid in (e["p1"], e["p2"]):
+            await notify(bot, uid, "🔔 <b>Ваша очередь!</b>\n" + text, kb)
+    q = await queue()
+    if q:
+        for uid in (q[0]["p1"], q[0]["p2"]):
+            await notify(bot, uid, "⏳ Вы <b>следующие</b> в очереди к столу. Будьте рядом!", queue_kb(q[0]["id"]))
 
 
 async def tables_text() -> str:
@@ -185,11 +313,47 @@ async def tables_text() -> str:
     for tb in rows:
         label = f"Стол {tb['table_no']}" if len(rows) > 1 else "Стол"
         if tb["busy"]:
-            who = name(users.get(tb["busy_by"]))
-            lines.append(f"🔴 <b>{label}</b> занят: {ui.esc(tb['note']) or who} — ещё ~{ui.dur(tb['busy_until'] - db.now())}")
+            who = pair_label(users, tb["busy_by"], tb["busy_with"]) if tb["busy_with"] else \
+                (tb["note"] or users.get(tb["busy_by"], {}).get("name", "?"))
+            what = "идёт матч" if tb["match_id"] else "занят"
+            score = ""
+            if tb["match_id"]:
+                m = await db.match(tb["match_id"])
+                if m and m["live"]:
+                    games, cur = logic.replay(m["live"]["pts"])
+                    score = f" · {ui.games_score(games)}, партия {cur[0]}:{cur[1]}"
+            lines.append(f"🔴 <b>{label}</b> {what}: {ui.esc(who)}{score} — ещё ~{ui.dur(tb['busy_until'] - db.now())}")
         else:
             lines.append(f"🟢 <b>{label}</b> свободен")
+    q = await queue()
+    if q:
+        lines.append("\n⏳ <b>Очередь:</b>")
+        lines += [f"{i}. {ui.esc(pair_label(users, e['p1'], e['p2']))} — ждут {ui.dur(db.now() - e['created_at'])}"
+                  for i, e in enumerate(q, 1)]
     return "\n".join(lines)
+
+
+async def attach_table(mt: dict) -> str:
+    """Матч начался: закрепить за ним стол пары или свободный стол."""
+    users = await umap()
+    note = pair_label(users, mt["p1"], mt["p2"])
+    async with LOCK:
+        tb = await pair_table(mt["p1"], mt["p2"])
+        if not tb and not await queue():
+            tb = next((t for t in await tables() if not t["busy"]), None)
+        if tb:
+            await occupy(tb["table_no"], mt["p1"], LIVE_MIN, note, mt["id"], mt["p2"])
+            await db.ex("UPDATE table_queue SET status='called' WHERE status='waiting' AND "
+                        "(p1 IN (?,?) OR p2 IN (?,?))", mt["p1"], mt["p2"], mt["p1"], mt["p2"])
+            return "Стол отмечен занятым за этим матчем ✅"
+    return ("⚠️ Стол сейчас занят или на него есть очередь — счёт ведём, "
+            "но проверьте, что не заняли чужую бронь.")
+
+
+async def search_users(text: str, exclude: set[int]) -> list[dict]:
+    q = text.strip().lower().lstrip("@")
+    return [u for u in await db.users() if u["tg_id"] not in exclude
+            and (q in u["name"].lower() or q in (u["username"] or "").lower())][:10]
 
 
 # ---------- результаты ----------
@@ -201,13 +365,17 @@ def score_card(m: dict, users: dict) -> str:
             f"Победитель: <b>{name(users.get(m['winner']))}</b>")
 
 
+def confirm_kb(mid: int):
+    return ikb([[("✅ Верно", f"cf:{mid}"), ("❌ Неверно", f"rj:{mid}")]])
+
+
 async def submit_result(bot: Bot, mid: int, scores: list[tuple[int, int]], reporter: int):
-    """Сохранить счёт (ориентирован p1:p2) и запустить подтверждение. Возвращает текст и клавиатуру для репортёра."""
+    """Счёт внёс сам игрок. Возвращает текст и клавиатуру для него."""
     m = await db.match(mid)
     win_idx = logic.games_winner(scores, m["best_of"])
     winner = m["p1"] if win_idx == 0 else m["p2"]
     await db.save_scores(mid, scores, winner, "pending", reported_by=reporter, live=None)
-    await free_table(match_id=mid)
+    await free_table(match_id=mid, bot=bot)
     m = await db.match(mid)
     users = await umap()
     card = score_card(m, users)
@@ -215,9 +383,25 @@ async def submit_result(bot: Bot, mid: int, scores: list[tuple[int, int]], repor
     if m["tournament_id"]:
         await notify(bot, opp, f"📝 {name(users.get(reporter))} внёс результат:\n{card}\n\nЖдём подтверждения судьи.")
         return card + "\n\n👨‍⚖️ <b>Кто судил матч?</b> Он подтвердит счёт:", await referee_kb(mid, users)
-    await notify(bot, opp, f"📝 {name(users.get(reporter))} внёс результат:\n{card}\n\nВсё верно?",
-                 ikb([[("✅ Верно", f"cf:{mid}"), ("❌ Неверно", f"rj:{mid}")]]))
+    await notify(bot, opp, f"📝 {name(users.get(reporter))} внёс результат:\n{card}\n\nВсё верно?", confirm_kb(mid))
     return card + "\n\nОтправил сопернику на подтверждение ✉️", None
+
+
+async def submit_by_referee(bot: Bot, mid: int, scores: list[tuple[int, int]], ref: int) -> str:
+    """Счёт вёл судья (не игрок): результат подтверждают оба игрока."""
+    m = await db.match(mid)
+    winner = m["p1"] if logic.games_winner(scores, m["best_of"]) == 0 else m["p2"]
+    await db.save_scores(mid, scores, winner, "pending", reported_by=ref, referee_id=ref, need_players=1,
+                         confirms="[]", live=None)
+    await free_table(match_id=mid, bot=bot)
+    m = await db.match(mid)
+    users = await umap()
+    card = score_card(m, users)
+    for uid in (m["p1"], m["p2"]):
+        await notify(bot, uid, f"👨‍⚖️ Судья <b>{name(users.get(ref))}</b> записал результат вашего матча:\n\n{card}\n\n"
+                               "Подтверди, что всё верно 👇 Результат засчитается, когда подтвердят оба игрока.",
+                     confirm_kb(mid))
+    return card + "\n\n✉️ Отправил игрокам на подтверждение."
 
 
 async def referee_kb(mid: int, users: dict):
@@ -244,14 +428,37 @@ async def ask_referee(bot: Bot, mid: int, ref_id: int):
         await notify(bot, uid, text, kb)
 
 
+def confirms_of(m: dict) -> list[int]:
+    return json.loads(m["confirms"]) if m.get("confirms") else []
+
+
 async def can_confirm(m: dict, uid: int) -> bool:
     u = await db.user(uid)
+    if m.get("need_players"):
+        # счёт вёл судья — подтверждают сами игроки (или админ, не игравший в матче)
+        if uid in (m["p1"], m["p2"]):
+            return uid not in confirms_of(m)
+        return db.is_admin(u)
     if m["tournament_id"]:
         # свой турнирный матч не может подтвердить даже админ
         return uid not in (m["p1"], m["p2"]) and (db.is_admin(u) or m["referee_id"] == uid)
     if db.is_admin(u):
         return True
     return uid in (m["p1"], m["p2"]) and uid != m["reported_by"]
+
+
+async def player_confirm(bot: Bot, m: dict, uid: int) -> bool:
+    """Игрок подтвердил счёт судьи. True — подтвердили оба, результат засчитан."""
+    confirms = confirms_of(m) + [uid]
+    await db.ex("UPDATE matches SET confirms=? WHERE id=?", json.dumps(confirms), m["id"])
+    if {m["p1"], m["p2"]} <= set(confirms):
+        await confirm(bot, m, m["referee_id"] or uid)
+        return True
+    other = m["p2"] if uid == m["p1"] else m["p1"]
+    users = await umap()
+    await notify(bot, other, f"✅ {name(users.get(uid))} подтвердил(а) счёт матча #{m['id']}. Ждём тебя 👇",
+                 confirm_kb(m["id"]))
+    return False
 
 
 async def confirm(bot: Bot, m: dict, by: int):
@@ -266,7 +473,7 @@ async def confirm(bot: Bot, m: dict, by: int):
             nxt = await next_matches(uid)
             if nxt:
                 extra += f"\n👉 Следующий соперник: <b>{ui.full(nxt[0][1])}</b> — {ui.status(nxt[0][1])[1]}"
-        await notify(bot, uid, f"✅ Результат подтверждён ({name(users.get(by))}):\n{card}{extra}")
+        await notify(bot, uid, f"✅ Результат засчитан (судья/подтвердил: {name(users.get(by))}):\n{card}{extra}")
     if m["tournament_id"]:
         left = await db.q1("SELECT COUNT(*) c FROM matches WHERE tournament_id=? AND status!='confirmed'", m["tournament_id"])
         if left["c"] == 0:
@@ -278,9 +485,14 @@ async def reject(bot: Bot, m: dict, by: int):
     users = await umap()
     if m["tournament_id"]:
         await db.ex("UPDATE matches SET status='scheduled', scores=NULL, winner=NULL, referee_id=NULL, "
-                    "reported_by=NULL WHERE id=?", m["id"])
+                    "reported_by=NULL, need_players=0, confirms=NULL WHERE id=?", m["id"])
     else:
         await db.ex("UPDATE matches SET status='rejected' WHERE id=?", m["id"])
-    for uid in (m["p1"], m["p2"]):
-        await notify(bot, uid, f"❌ {name(users.get(by))} отклонил результат матча #{m['id']}. "
-                               f"Внесите счёт заново через «{ui.B_RES}».")
+    for uid in {m["p1"], m["p2"], m["referee_id"]} - {None, 0}:
+        await notify(bot, uid, f"❌ {name(users.get(by))} отклонил(а) результат матча #{m['id']}. "
+                               f"Сыграйте или внесите счёт заново через «{ui.B_LIVE}» / «{ui.B_RES}».")
+
+
+async def housekeeping(bot: Bot):
+    """Каждые несколько секунд: сгоревшие брони → следующей паре из очереди."""
+    await advance_queue(bot)
