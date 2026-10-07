@@ -164,12 +164,38 @@ async def book(c: CallbackQuery, bot: Bot):
 async def unbook(c: CallbackQuery, bot: Bot):
     _, a, b = c.data.split(":")
     tb = await services.pair_table(int(a), int(b))
+    other = int(b) if c.from_user.id == int(a) else int(a)
     if tb and not tb["match_id"]:
         await services.free_table(tb["table_no"], bot=bot)
-        other = int(b) if c.from_user.id == int(a) else int(a)
-        await services.notify(bot, other, f"❌ {name(await db.user(c.from_user.id))} снял(а) бронь стола.")
-    await c.answer("Бронь снята")
-    await c.message.edit_text("Бронь снята, стол отдан следующим.")
+        await services.notify(bot, other, f"🏁 {name(await db.user(c.from_user.id))} освободил(а) стол.")
+    await c.answer("Стол свободен")
+    await c.message.edit_text("🏁 Стол освобождён, спасибо! Если ещё не внесли счёт — сделайте это сейчас:",
+                              reply_markup=ikb([[("✍️ Внести результат", f"res2:{a}:{b}")]]))
+
+
+@router.callback_query(F.data.startswith("bkp:"))
+async def started_playing(c: CallbackQuery, bot: Bot):
+    """Пара подошла к столу: держим стол за ней дольше, чем 10 минут брони."""
+    _, a, b = c.data.split(":")
+    a, b = int(a), int(b)
+    async with services.LOCK:
+        tb = await services.pair_table(a, b)
+        if tb and not tb["match_id"]:
+            users = await services.umap()
+            await services.occupy(tb["table_no"], a, services.PLAY_MIN, services.pair_label(users, a, b), None, b)
+    if not tb:
+        await c.answer("Бронь уже сгорела — бронирую заново")
+        res, val = await services.request_table(a, b, book=True)
+        text, kb = await services.table_result_text(res, val, a, b)
+        await c.message.edit_text(text, reply_markup=kb)
+        return
+    await c.answer("Удачной игры! 🏓")
+    other = b if c.from_user.id == a else a
+    text = (f"🏓 Играете! Стол за вами {services.PLAY_MIN} минут.\n"
+            "Сыграли — впишите счёт и освободите стол 👇")
+    kb = ikb([[("✍️ Внести результат", f"res2:{a}:{b}")], [("🏁 Закончили", f"bkx:{a}:{b}")]])
+    await c.message.edit_text(text, reply_markup=kb)
+    await services.notify(bot, other, text, kb)
 
 
 @router.callback_query(F.data.startswith("qx:"))
@@ -201,13 +227,15 @@ async def show_tables(m: Message, uid: int, edit: bool = False):
         if not tb["busy"] and not has_queue:
             rows.append([(f"Занять{suffix} на 15 мин", f"tb:{tb['table_no']}:15"),
                          ("на 30 мин", f"tb:{tb['table_no']}:30")])
-        elif tb["busy"] and not tb["match_id"] and (uid in (tb["busy_by"], tb["busy_with"])
-                                                     or db.is_admin(await db.user(uid))):
-            rows.append([(f"🟢 Освободить стол{suffix}", f"tb:{tb['table_no']}:0")])
+        elif tb["busy"] and (uid in (tb["busy_by"], tb["busy_with"]) or db.is_admin(await db.user(uid))):
+            if tb["match_id"]:
+                rows.append([(f"⏹ Завершить матч без результата{suffix}", f"lend:{tb['match_id']}")])
+            else:
+                rows.append([(f"🏁 Закончили — освободить стол{suffix}", f"tb:{tb['table_no']}:0")])
     live_n = len(await db.matches("status='live'"))
     if live_n:
-        rows.append([(f"👀 Смотреть матч со счётом ({live_n})", "lwl")])
-    rows.append([("👨‍⚖️ Судить игру", "lref")])
+        rows.append([(f"👀 Смотреть турнирный матч ({live_n})", "lwl")])
+    rows.append([("👨‍⚖️ Судить турнирный матч", "lref")])
     text = await services.tables_text()
     if has_queue:
         text += "\n\nЧтобы встать в очередь, пригласи соперника в «👥 Кто готов» — пара встанет в очередь сама."

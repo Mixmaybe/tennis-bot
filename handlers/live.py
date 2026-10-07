@@ -25,24 +25,8 @@ class J(StatesGroup):
 
 # ---------- выбор матча для пары ----------
 
-async def tournament_match_between(a: int, b: int) -> dict | None:
-    t = await db.active_tournament()
-    if not t or t["status"] != "running":
-        return None
-    ms = await db.matches("tournament_id=? AND status='scheduled' AND ((p1=? AND p2=?) OR (p1=? AND p2=?))",
-                          t["id"], a, b, b, a)
-    return ms[0] if ms else None
-
-
 PAIR_SQL = "((p1=? AND p2=?) OR (p1=? AND p2=?))"
 STALE_SEC = 30 * 60  # матч без единого очка 30 минут считается брошенным
-
-
-async def pair_match(a: int, b: int) -> dict | None:
-    """Начатый или уже идущий матч именно этой пары."""
-    rows = await db.matches(f"status IN ('setup','live') AND {PAIR_SQL} ORDER BY status='live' DESC, id DESC",
-                            a, b, b, a)
-    return rows[0] if rows else None
 
 
 async def busy_player(a: int, b: int) -> dict | None:
@@ -68,16 +52,19 @@ async def join_existing(c: CallbackQuery, bot: Bot, mt: dict):
         await ask_server(c.message, mt["id"])
 
 
+FRIENDLY_NO_LIVE = (f"🤝 Живой счёт ведётся только в <b>турнирных</b> матчах.\n"
+                    f"Дружескую игру просто сыграйте, а потом нажмите «{ui.B_RES}» и впишите счёт.")
+
+
 async def setup_pair(m: Message, a: int, b: int):
     users = await services.umap()
-    rows = []
-    tm = await tournament_match_between(a, b)
+    pair = f"🏓 <b>{name(users.get(a))}</b> — <b>{name(users.get(b))}</b>\n"
+    tm = await services.tournament_match_between(a, b)
     if tm:
-        rows.append([(f"🏆 Турнирный матч #{tm['id']} (до {logic.need_wins(tm['best_of'])} побед)", f"lt:{tm['id']}")])
-    rows.append([("🤝 Одна партия", f"lf:{a}:{b}:1")])
-    rows.append([("🤝 До 2 побед (2–3 партии)", f"lf:{a}:{b}:3")])
-    await m.answer(f"🏓 <b>{name(users.get(a))}</b> — <b>{name(users.get(b))}</b>\nКакой матч играете?",
-                   reply_markup=ikb(rows))
+        await m.answer(pair + "У вас есть несыгранный турнирный матч. Ведём счёт?", reply_markup=ikb([
+            [(f"🏆 Турнирный матч #{tm['id']} (до {logic.need_wins(tm['best_of'])} побед)", f"lt:{tm['id']}")]]))
+        return
+    await m.answer(pair + FRIENDLY_NO_LIVE, reply_markup=ikb([[("✍️ Внести результат", f"res2:{a}:{b}")]]))
 
 
 @router.callback_query(F.data.startswith("lp:"))
@@ -89,22 +76,10 @@ async def lp(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lf:"))
 async def lf(c: CallbackQuery, bot: Bot):
+    """Старые кнопки «одна партия / до 2 побед»: живой счёт для дружеских игр больше не ведётся."""
     _, a, b, bo = c.data.split(":")
-    a, b = int(a), int(b)
-    own = await pair_match(a, b)
-    if own:
-        if own["status"] == "setup" and own["best_of"] != int(bo):
-            await db.ex("UPDATE matches SET best_of=? WHERE id=?", int(bo), own["id"])
-        await join_existing(c, bot, own)
-        return
-    other = await busy_player(a, b)
-    if other:
-        await busy_alert(c, other)
-        return
-    mid = await db.ex("INSERT INTO matches(tournament_id, p1, p2, status, best_of, created_at) "
-                      "VALUES (NULL, ?, ?, 'setup', ?, ?)", a, b, int(bo), db.now())
     await c.answer()
-    await ask_server(c.message, mid)
+    await c.message.answer(FRIENDLY_NO_LIVE, reply_markup=ikb([[("✍️ Внести результат", f"res2:{a}:{b}")]]))
 
 
 @router.callback_query(F.data.startswith("lt:"))
@@ -224,7 +199,8 @@ async def render(mid: int, mode: str):
             [("↩️ Отменить", f"lv:undo:{mid}"), ("⏹ Прервать", f"lv:stop:{mid}")],
         ])
     return text + "\n👀 Ты смотришь матч, счёт обновляется сам.", ikb([
-        [("🖊 Вести счёт (судить)", f"lj:{mid}"), ("🔕 Не следить", f"lu:{mid}")]])
+        [("🖊 Вести счёт (судить)", f"lj:{mid}"), ("🔕 Не следить", f"lu:{mid}")],
+        [("⏹ Завершить матч без результата", f"lend:{mid}")]])
 
 
 async def broadcast(bot: Bot, mid: int, final: str | None = None, skip: tuple[int, int] | None = None):
@@ -350,10 +326,53 @@ async def live_watch(c: CallbackQuery, bot: Bot):
     await open_view(bot, mid, c.from_user.id, "watch")
 
 
+async def end_match(bot: Bot, mt: dict, by: int, reason: str):
+    """Снять матч без результата: турнирный возвращается в расписание, дружеский удаляется."""
+    async with LIVE_LOCK:
+        if mt["tournament_id"]:
+            await db.ex("UPDATE matches SET status='scheduled', live=NULL WHERE id=? AND status IN ('live','setup')",
+                        mt["id"])
+        else:
+            await db.ex("DELETE FROM matches WHERE id=? AND status IN ('live','setup')", mt["id"])
+    await services.free_table(match_id=mt["id"], bot=bot)
+    watching = {v["chat_id"] for v in await db.q("SELECT chat_id FROM live_views WHERE match_id=?", mt["id"])}
+    await broadcast(bot, mt["id"], reason)
+    for p in (mt["p1"], mt["p2"]):
+        if p != by and p not in watching:  # у кого открыто табло — увидит там
+            await services.notify(bot, p, reason)
+
+
+@router.callback_query(F.data.startswith("lend:"))
+async def live_end(c: CallbackQuery, bot: Bot):
+    mid = int(c.data.split(":")[1])
+    mt = await db.match(mid)
+    if not mt or mt["status"] not in ("live", "setup"):
+        await c.answer("Этот матч уже завершён", show_alert=True)
+        return
+    uid = c.from_user.id
+    if uid not in (mt["p1"], mt["p2"]) and uid != mt["scorer"] and not db.is_admin(await db.user(uid)):
+        await c.answer("Завершить матч может только игрок, судья или админ", show_alert=True)
+        return
+    await c.answer("Матч завершён")
+    who = name(await db.user(uid))
+    await end_match(bot, mt, uid, f"⏹ {who} завершил(а) матч без результата. Стол свободен."
+                    + ("\nТурнирный матч остался в расписании — сыграете позже." if mt["tournament_id"] else ""))
+    try:
+        await c.message.edit_text("⏹ Матч завершён без результата. Стол свободен.")
+    except Exception:
+        pass
+
+
 async def close_stale(bot: Bot):
-    """Закрыть брошенные матчи: живой счёт без очков 30 минут, незапущенные заготовки — тоже."""
+    """Закрыть брошенные матчи: живой счёт без очков 30 минут, незапущенные заготовки — тоже.
+    Дружеские матчи с живым счётом (старый режим) закрываются сразу."""
     limit = db.now() - STALE_SEC
     for mt in await db.matches("status IN ('live','setup')"):
+        if not mt["tournament_id"] and mt["status"] == "live":
+            await end_match(bot, mt, 0, "⏹ Живой счёт теперь ведётся только в турнирных матчах, этот матч закрыт. "
+                                        f"Сыграли дружескую — нажмите «{ui.B_RES}» и впишите счёт.")
+            logging.info("closed friendly live match %s", mt["id"])
+            continue
         last = (mt["live"] or {}).get("t") or mt["created_at"] or 0
         if last >= limit:
             continue
@@ -409,8 +428,8 @@ async def judge_menu(c: CallbackQuery, state: FSMContext):
     await state.set_state(J.p1)
     await c.answer()
     await c.message.answer(
-        "👨‍⚖️ <b>Судить игру</b>\n\nВыбери пару у стола или <b>напиши имя первого игрока</b>:"
-        if rows else "👨‍⚖️ <b>Судить игру</b>\n\n<b>Напиши имя первого игрока</b> (можно часть):",
+        "👨‍⚖️ <b>Судить турнирный матч</b>\n\nВыбери пару у стола или <b>напиши имя первого игрока</b>:"
+        if rows else "👨‍⚖️ <b>Судить турнирный матч</b>\n\n<b>Напиши имя первого игрока</b> (можно часть):",
         reply_markup=ikb(rows) if rows else None)
 
 

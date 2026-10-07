@@ -95,6 +95,15 @@ async def standings_text(t: dict, league: str, users: dict | None = None) -> str
     return head + "<pre>" + ui.esc("\n".join(lines)) + "</pre>"
 
 
+async def tournament_match_between(a: int, b: int) -> dict | None:
+    t = await db.active_tournament()
+    if not t or t["status"] != "running":
+        return None
+    ms = await db.matches("tournament_id=? AND status='scheduled' AND ((p1=? AND p2=?) OR (p1=? AND p2=?))",
+                          t["id"], a, b, b, a)
+    return ms[0] if ms else None
+
+
 async def next_matches(uid: int) -> list[tuple[dict, dict]]:
     """Несыгранные турнирные матчи игрока, отсортированные: сначала те, чей соперник готов играть."""
     t = await db.active_tournament()
@@ -157,6 +166,7 @@ async def my_matches_text(uid: int) -> str:
 # следующий (даже на долю секунды позже) попадает в очередь.
 LOCK = asyncio.Lock()
 BOOK_MIN = 10        # бронь стола для пары
+PLAY_MIN = 30        # пара нажала «Начали играть» — стол за ней на это время
 LIVE_MIN = 20        # стол держится за матчем, пока ведут счёт (продлевается каждым очком)
 QUEUE_TTL = 90 * 60  # заявка в очереди сгорает через 1,5 часа
 
@@ -261,10 +271,17 @@ async def table_result_text(kind: str, val, a: int, b: int) -> tuple[str, object
     if kind in ("booked", "own"):
         label = f" {val['table_no']}" if len(await tables()) > 1 else ""
         left = ui.dur(val["busy_until"] - db.now()) if kind == "own" else f"{BOOK_MIN} мин"
-        return (f"✅ Стол{label} забронирован за вами (<b>{ui.esc(pair_label(users, a, b))}</b>) — {left}.\n"
-                "Подходите! Начните «Вести счёт», и стол будет держаться за вами всю игру. "
-                "Если не подойдёте — бронь сгорит и стол уйдёт следующим.",
-                ikb([[("▶️ Начать матч и вести счёт", f"lp:{a}:{b}")], [("❌ Снять бронь", f"bkx:{a}:{b}")]]))
+        rows = []
+        if await tournament_match_between(a, b):
+            rows.append([("🏆 Турнирный матч — вести счёт", f"lp:{a}:{b}")])
+        rows += [[("🏓 Начали играть", f"bkp:{a}:{b}")],
+                 [("✍️ Внести результат", f"res2:{a}:{b}")],
+                 [("🏁 Закончили / снять бронь", f"bkx:{a}:{b}")]]
+        return (f"✅ Стол{label} забронирован за вами (<b>{ui.esc(pair_label(users, a, b))}</b>) — {left}.\n\n"
+                f"Подошли к столу — нажмите «🏓 Начали играть», стол будет за вами {PLAY_MIN} минут.\n"
+                "Сыграли — «✍️ Внести результат» и «🏁 Закончили», чтобы стол достался следующим.\n"
+                "Не подойдёте — бронь сгорит сама.",
+                ikb(rows))
     if kind == "free":
         return ("🟢 <b>Стол сейчас свободен!</b> Забронировать его за вами на 10 минут?",
                 ikb([[("🟢 Забронировать на 10 минут", f"bk:{a}:{b}")]]))

@@ -12,10 +12,11 @@ B_WHO = "👥 Кто готов"
 B_TABLE = "🟢 Стол"
 B_STAND = "🏆 Таблица"
 B_MY = "📅 Мои матчи"
-B_LIVE = "▶️ Вести счёт"
+B_LIVE = "🏆 Счёт турнира"
+OLD_BUTTONS = {"▶️ Вести счёт"}  # старая клавиатура у тех, кто ещё не нажимал /start
 B_RES = "✍️ Внести результат"
 B_PROF = "👤 Профиль"
-MENU = {B_STATUS, B_WHO, B_TABLE, B_STAND, B_MY, B_LIVE, B_RES, B_PROF}
+MENU = {B_STATUS, B_WHO, B_TABLE, B_STAND, B_MY, B_LIVE, B_RES, B_PROF, *OLD_BUTTONS}
 
 # код: (подпись, через сколько минут готов, сколько минут статус действует после этого)
 STATUSES = {
@@ -39,7 +40,7 @@ def is_work_time(ts: int) -> bool:
 
 
 def main_kb() -> ReplyKeyboardMarkup:
-    rows = [[B_STATUS, B_WHO], [B_TABLE, B_STAND], [B_MY, B_LIVE], [B_RES, B_PROF]]
+    rows = [[B_STATUS, B_WHO], [B_TABLE, B_STAND], [B_MY, B_RES], [B_LIVE, B_PROF]]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,

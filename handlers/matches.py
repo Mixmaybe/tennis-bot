@@ -29,33 +29,45 @@ async def my_matches(m: Message, state: FSMContext):
     if not await db.user(m.chat.id):
         await m.answer("Сначала зарегистрируйся: /start")
         return
-    nxt = await services.next_matches(m.chat.id)
-    kb = None
+    uid = m.chat.id
+    rows = []
+    # сейчас играю — можно завершить без результата / освободить стол
+    for mt in await db.matches("status='live' AND (p1=? OR p2=?)", uid, uid):
+        rows.append([("⏹ Завершить идущий матч без результата", f"lend:{mt['id']}")])
+    for tb in await services.tables():
+        if tb["busy"] and not tb["match_id"] and uid in (tb["busy_by"], tb["busy_with"]) and tb["busy_with"]:
+            a, b = tb["busy_by"], tb["busy_with"]
+            rows.append([("✍️ Внести результат", f"res2:{a}:{b}"), ("🏁 Закончили", f"bkx:{a}:{b}")])
+    nxt = await services.next_matches(uid)
     if nxt:
         opp = nxt[0][1]
-        kb = ikb([[(f"📨 Пригласить {opp['name']}", f"inv:{opp['tg_id']}")],
-                  [("▶️ Начать матч и вести счёт", f"pick:live:t:{nxt[0][0]['id']}")]])
-    await m.answer(await services.my_matches_text(m.chat.id), reply_markup=kb)
+        rows += [[(f"📨 Пригласить {opp['name']}", f"inv:{opp['tg_id']}")],
+                 [("🏆 Начать турнирный матч и вести счёт", f"pick:live:t:{nxt[0][0]['id']}")]]
+    await m.answer(await services.my_matches_text(uid), reply_markup=ikb(rows) if rows else None)
 
 
 # ---------- выбор матча ----------
 
 async def choose_match(m: Message, uid: int, purpose: str):
-    """purpose: live — вести счёт, res — внести результат."""
-    rows = [[(f"🏆 #{mt['id']} vs {opp['name']}", f"pick:{purpose}:t:{mt['id']}")]
-            for mt, opp in (await services.next_matches(uid))[:8]]
-    rows.append([("🤝 Дружеская игра", f"pick:{purpose}:f")])
-    if purpose == "live":
-        rows.append([("👨‍⚖️ Судить игру других", "lref")])
-        n = len(await db.matches("status='live'"))
-        if n:
-            rows.append([(f"👀 Смотреть идущие матчи ({n})", "lwl")])
-    title = ("▶️ <b>Ведём счёт.</b> С кем играешь?\n\n"
-                                         "Или стань судьёй чужой игры — игроки увидят счёт в реальном времени.") if purpose == "live" else "✍️ <b>Внести результат.</b> Какой матч?"
-    await m.answer(title, reply_markup=ikb(rows))
+    """purpose: live — вести счёт турнирного матча, res — внести результат."""
+    nxt = (await services.next_matches(uid))[:8]
+    rows = [[(f"🏆 #{mt['id']} vs {opp['name']}", f"pick:{purpose}:t:{mt['id']}")] for mt, opp in nxt]
+    if purpose == "res":
+        rows.append([("🤝 Дружеская игра", "pick:res:f")])
+        await m.answer("✍️ <b>Внести результат.</b> Какой матч сыграли?", reply_markup=ikb(rows))
+        return
+    rows.append([("👨‍⚖️ Судить турнирный матч других", "lref")])
+    n = len(await db.matches("status='live'"))
+    if n:
+        rows.append([(f"👀 Смотреть идущие матчи ({n})", "lwl")])
+    text = ("🏆 <b>Живой счёт — только для турнирных матчей.</b>\n"
+            + ("Выбери свой матч, чтобы вести счёт кнопками «+1», или стань судьёй чужого:" if nxt else
+               "У тебя сейчас нет несыгранных турнирных матчей, но можно судить чужой:")
+            + f"\n\n🤝 Сыграли дружескую игру? Нажми «{ui.B_RES}» и впиши счёт.")
+    await m.answer(text, reply_markup=ikb(rows))
 
 
-@router.message(F.text == ui.B_LIVE)
+@router.message(F.text.in_({ui.B_LIVE, *ui.OLD_BUTTONS}))
 async def live_cmd(m: Message, state: FSMContext):
     await state.clear()
     if await db.user(m.chat.id):
@@ -76,35 +88,49 @@ async def pick(c: CallbackQuery, state: FSMContext):
     uid = c.from_user.id
     await c.answer()
     if kind == "f":
-        await opponent_menu(c.message, uid, purpose, state)
+        await opponent_menu(c.message, uid, "res", state)
         return
-    if kind == "u" and purpose == "live":
-        await state.clear()
-        await live.setup_pair(c.message, uid, int(parts[3]))
+    if kind == "u":  # выбран соперник для дружеской игры — только внести результат
+        await friendly_result(c.message, state, uid, int(parts[3]))
         return
-    if kind == "u":  # выбран соперник для дружеской игры
-        opp = int(parts[3])
-        mid = await db.ex("INSERT INTO matches(tournament_id, p1, p2, status, best_of, created_at) "
-                          "VALUES (NULL, ?, ?, 'setup', ?, ?)", uid, opp, config.BEST_OF, db.now())
-    else:
-        mid = int(parts[3])
-        mt = await db.match(mid)
-        if not mt or mt["status"] != "scheduled" or uid not in (mt["p1"], mt["p2"]):
-            await c.message.answer("Этот матч уже сыгран или идёт.")
-            return
+    mid = int(parts[3])
+    mt = await db.match(mid)
+    if not mt or mt["status"] != "scheduled" or uid not in (mt["p1"], mt["p2"]):
+        await c.message.answer("Этот матч уже сыгран или идёт.")
+        return
     if purpose == "live":
         await live.ask_server(c.message, mid)
     else:
-        await state.set_state(S.scores)
-        await state.update_data(mid=mid)
-        mt = await db.match(mid)
-        opp = await db.user(mt["p2"] if mt["p1"] == uid else mt["p1"])
-        need = logic.need_wins(mt["best_of"])
-        fmt = (f"Турнирный матч — до {need} побед в партиях." if mt["tournament_id"]
-               else "Можно одну партию или матч до 2 побед.")
-        await c.message.answer(
-            f"Напиши счёт каждой партии против <b>{name(opp)}</b> — <b>сначала твои очки</b>.\n"
-            f"{fmt} Например:\n<code>11:7 9:11 11:5</code> или <code>11:8</code>")
+        await ask_scores(c.message, state, mid, uid)
+
+
+@router.callback_query(F.data.startswith("res2:"))
+async def res_for_pair(c: CallbackQuery, state: FSMContext):
+    """Кнопка «Внести результат» из брони стола: соперник — второй из пары."""
+    _, a, b = c.data.split(":")
+    a, b = int(a), int(b)
+    uid = c.from_user.id
+    await c.answer()
+    await friendly_result(c.message, state, uid, b if uid == a else a)
+
+
+async def friendly_result(m: Message, state: FSMContext, uid: int, opp: int):
+    mid = await db.ex("INSERT INTO matches(tournament_id, p1, p2, status, best_of, created_at) "
+                      "VALUES (NULL, ?, ?, 'setup', ?, ?)", uid, opp, config.BEST_OF, db.now())
+    await ask_scores(m, state, mid, uid)
+
+
+async def ask_scores(m: Message, state: FSMContext, mid: int, uid: int):
+    await state.set_state(S.scores)
+    await state.update_data(mid=mid)
+    mt = await db.match(mid)
+    opp = await db.user(mt["p2"] if mt["p1"] == uid else mt["p1"])
+    need = logic.need_wins(mt["best_of"])
+    fmt = (f"Турнирный матч — до {need} побед в партиях." if mt["tournament_id"]
+           else "Можно одну партию или матч до 2 побед.")
+    await m.answer(
+        f"Напиши счёт каждой партии против <b>{name(opp)}</b> — <b>сначала твои очки</b>.\n"
+        f"{fmt} Например:\n<code>11:7 9:11 11:5</code> или <code>11:8</code>")
 
 
 async def opponent_menu(m: Message, uid: int, purpose: str, state: FSMContext):
