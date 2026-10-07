@@ -106,8 +106,7 @@ def league_name(code: str | None) -> str:
 
 
 def profile_text(u: dict) -> str:
-    unit = logic.UNITS.get(u["exp_unit"] or "", ("", 1))[0]
-    exp = f"{u['exp_value']} {unit}" if u["exp_value"] else "только начинаю"
+    exp = logic.plural(u["exp_value"], u["exp_unit"]) if u["exp_value"] and u["exp_unit"] else "только начинаю"
     return (
         f"👤 <b>{name(u)}</b>\n"
         f"Отдел: {esc(u['department'])}\n"

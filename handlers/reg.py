@@ -156,8 +156,7 @@ async def reg_level(c: CallbackQuery, state: FSMContext):
     await state.update_data(level=level)
     await state.set_state(Reg.confirm)
     d = await state.get_data()
-    unit = logic.UNITS[d["unit"]][0] if d.get("unit") else ""
-    exp = f"{d['value']} {unit}" if d.get("unit") else "ещё не играл(а)"
+    exp = logic.plural(d["value"], d["unit"]) if d.get("unit") else "ещё не играл(а)"
     await c.answer()
     await c.message.edit_text(
         "📝 <b>Проверь, всё ли верно:</b>\n\n"

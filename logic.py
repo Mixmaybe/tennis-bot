@@ -10,6 +10,16 @@ LEVELS = {
     5: "Профессионал",
 }
 UNITS = {"d": ("дней", 1), "m": ("месяцев", 30), "y": ("лет", 365)}
+UNIT_FORMS = {"d": ("день", "дня", "дней"), "m": ("месяц", "месяца", "месяцев"), "y": ("год", "года", "лет")}
+
+
+def plural(n: int, unit: str) -> str:
+    one, few, many = UNIT_FORMS[unit]
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} {one}"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} {few}"
+    return f"{n} {many}"
 
 # (код, название, минимальный рейтинг посева)
 LEAGUES = [
