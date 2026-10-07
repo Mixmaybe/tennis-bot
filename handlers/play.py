@@ -63,7 +63,7 @@ async def set_status(c: CallbackQuery, bot: Bot):
     await c.answer("Статус обновлён")
     await c.message.edit_text(f"Статус: {ui.status(u)[1]}\n\n{await services.tables_text()}")
     if ui.is_work_time(ready_at):
-        await c.message.answer(ui.WORK_NOTICE)
+        await c.message.answer(f"❗️❗️❗️❗️❗️❗️❗️❗️❗️❗️\n\n<b>{ui.WORK_NOTICE}</b>\n\n❗️❗️❗️❗️❗️❗️❗️❗️❗️❗️")
     # Предложить турнирного соперника, если он тоже ищет игру, и сообщить ему
     for mt, opp in await services.next_matches(uid):
         if ui.status(opp)[0]:
