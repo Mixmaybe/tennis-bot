@@ -1,0 +1,11 @@
+# secrets — bot token and admin IDs
+.env
+
+# local database with players' data
+*.db
+*.db-journal
+
+# python
+.venv/
+__pycache__/
+*.pyc
