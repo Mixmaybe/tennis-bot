@@ -1,5 +1,6 @@
 """Тексты, кнопки и форматирование."""
 import html
+from datetime import datetime
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
@@ -28,6 +29,13 @@ STATUSES = {
 
 WORK_NOTICE = ("💼 Разработчики не поддерживают игру в теннис во время работы, только после её окончания. "
                "Работа — в приоритете!")
+# Рабочие часы по времени компьютера, на котором запущен бот: 9:00–13:00 и 14:00–18:00 (обед свободен)
+WORK_HOURS = [(9, 13), (14, 18)]
+
+
+def is_work_time(ts: int) -> bool:
+    t = datetime.fromtimestamp(ts)
+    return any(start <= t.hour < end for start, end in WORK_HOURS)
 
 
 def main_kb() -> ReplyKeyboardMarkup:
