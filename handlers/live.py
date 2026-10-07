@@ -34,9 +34,38 @@ async def tournament_match_between(a: int, b: int) -> dict | None:
     return ms[0] if ms else None
 
 
-async def busy_player(a: int, b: int) -> dict | None:
-    rows = await db.matches("status='live' AND (p1 IN (?,?) OR p2 IN (?,?))", a, b, a, b)
+PAIR_SQL = "((p1=? AND p2=?) OR (p1=? AND p2=?))"
+STALE_SEC = 30 * 60  # матч без единого очка 30 минут считается брошенным
+
+
+async def pair_match(a: int, b: int) -> dict | None:
+    """Начатый или уже идущий матч именно этой пары."""
+    rows = await db.matches(f"status IN ('setup','live') AND {PAIR_SQL} ORDER BY status='live' DESC, id DESC",
+                            a, b, b, a)
     return rows[0] if rows else None
+
+
+async def busy_player(a: int, b: int) -> dict | None:
+    """Идущий матч одного из игроков с КЕМ-ТО ДРУГИМ."""
+    rows = await db.matches(f"status='live' AND (p1 IN (?,?) OR p2 IN (?,?)) AND NOT {PAIR_SQL}",
+                            a, b, a, b, a, b, b, a)
+    return rows[0] if rows else None
+
+
+async def busy_alert(c: CallbackQuery, other: dict) -> None:
+    users = await services.umap()
+    await c.answer(f"{services.pair_label(users, other['p1'], other['p2'])} — сейчас идёт этот матч. "
+                   "Дождитесь, пока он закончится.", show_alert=True)
+
+
+async def join_existing(c: CallbackQuery, bot: Bot, mt: dict):
+    """Второй игрок (или судья) нажал кнопку позже: подключаем к тому же матчу, а не ругаемся."""
+    if mt["status"] == "live":
+        await c.answer("Ваш матч уже идёт — открываю табло")
+        await open_view(bot, mt["id"], c.from_user.id, "ctl")
+    else:
+        await c.answer("Подключаю к вашему матчу")
+        await ask_server(c.message, mt["id"])
 
 
 async def setup_pair(m: Message, a: int, b: int):
@@ -59,11 +88,18 @@ async def lp(c: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("lf:"))
-async def lf(c: CallbackQuery):
+async def lf(c: CallbackQuery, bot: Bot):
     _, a, b, bo = c.data.split(":")
     a, b = int(a), int(b)
-    if await busy_player(a, b):
-        await c.answer("У одного из игроков уже идёт матч", show_alert=True)
+    own = await pair_match(a, b)
+    if own:
+        if own["status"] == "setup" and own["best_of"] != int(bo):
+            await db.ex("UPDATE matches SET best_of=? WHERE id=?", int(bo), own["id"])
+        await join_existing(c, bot, own)
+        return
+    other = await busy_player(a, b)
+    if other:
+        await busy_alert(c, other)
         return
     mid = await db.ex("INSERT INTO matches(tournament_id, p1, p2, status, best_of, created_at) "
                       "VALUES (NULL, ?, ?, 'setup', ?, ?)", a, b, int(bo), db.now())
@@ -72,11 +108,18 @@ async def lf(c: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("lt:"))
-async def lt(c: CallbackQuery):
+async def lt(c: CallbackQuery, bot: Bot):
     mid = int(c.data.split(":")[1])
     mt = await db.match(mid)
+    if mt and mt["status"] == "live":
+        await join_existing(c, bot, mt)
+        return
     if not mt or mt["status"] != "scheduled":
-        await c.answer("Этот матч уже сыгран или идёт", show_alert=True)
+        await c.answer("Этот матч уже сыгран и ждёт подтверждения", show_alert=True)
+        return
+    other = await busy_player(mt["p1"], mt["p2"])
+    if other:
+        await busy_alert(c, other)
         return
     await c.answer()
     await ask_server(c.message, mid)
@@ -95,14 +138,27 @@ async def ask_server(m: Message, mid: int):
 async def live_start(c: CallbackQuery, bot: Bot):
     _, mid, fs = c.data.split(":")
     mid = int(mid)
-    mt = await db.match(mid)
-    if mt["status"] not in ("scheduled", "setup"):
-        await c.answer("Матч уже идёт или сыгран", show_alert=True)
-        return
-    starter = c.from_user.id
-    players = (mt["p1"], mt["p2"])
-    await db.ex("UPDATE matches SET status='live', scorer=? WHERE id=?", starter, mid)
-    await db.set_live(mid, {"fs": int(fs), "pts": [], "refs": [] if starter in players else [starter]})
+    async with LIVE_LOCK:
+        mt = await db.match(mid)
+        if not mt:
+            await c.answer("Матч не найден", show_alert=True)
+            return
+        if mt["status"] == "live":
+            # соперник уже выбрал подачу — просто показываем табло
+            await join_existing(c, bot, mt)
+            return
+        if mt["status"] not in ("scheduled", "setup"):
+            await c.answer("Этот матч уже сыгран", show_alert=True)
+            return
+        other = await busy_player(mt["p1"], mt["p2"])
+        if other:
+            await busy_alert(c, other)
+            return
+        starter = c.from_user.id
+        players = (mt["p1"], mt["p2"])
+        await db.ex("UPDATE matches SET status='live', scorer=? WHERE id=?", starter, mid)
+        await db.set_live(mid, {"fs": int(fs), "pts": [], "refs": [] if starter in players else [starter],
+                                "t": db.now()})
     note = await services.attach_table(await db.match(mid))
     await c.answer()
     await c.message.edit_text(note)
@@ -254,6 +310,7 @@ async def live_action(c: CallbackQuery, bot: Bot):
                             "\n\n⏳ Результат отправлен на подтверждение.", skip=here)
             await c.message.edit_text(text, reply_markup=kb)
             return
+        live["t"] = db.now()
         await db.set_live(mid, live)
         await db.ex("UPDATE tables SET busy_until=? WHERE match_id=?", db.now() + services.LIVE_MIN * 60, mid)
     await c.answer()
@@ -291,6 +348,26 @@ async def live_watch(c: CallbackQuery, bot: Bot):
         return
     await c.answer()
     await open_view(bot, mid, c.from_user.id, "watch")
+
+
+async def close_stale(bot: Bot):
+    """Закрыть брошенные матчи: живой счёт без очков 30 минут, незапущенные заготовки — тоже."""
+    limit = db.now() - STALE_SEC
+    for mt in await db.matches("status IN ('live','setup')"):
+        last = (mt["live"] or {}).get("t") or mt["created_at"] or 0
+        if last >= limit:
+            continue
+        async with LIVE_LOCK:
+            if mt["tournament_id"]:
+                await db.ex("UPDATE matches SET status='scheduled', live=NULL WHERE id=? AND status IN ('live','setup')",
+                            mt["id"])
+            else:
+                await db.ex("DELETE FROM matches WHERE id=? AND status IN ('live','setup')", mt["id"])
+        await services.free_table(match_id=mt["id"], bot=bot)
+        if mt["status"] == "live":
+            await broadcast(bot, mt["id"], "⏹ Матч закрыт: 30 минут не было ни одного очка. "
+                                           "Счёт не сохранён — если играете, начните заново.")
+        logging.info("closed stale match %s", mt["id"])
 
 
 # ---------- список идущих матчей и судейство чужой игры ----------

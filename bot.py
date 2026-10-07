@@ -16,6 +16,7 @@ async def ticker(bot: Bot):
     """Сгоревшие брони стола передаются следующей паре из очереди."""
     while True:
         try:
+            await live.close_stale(bot)
             await services.housekeeping(bot)
         except Exception:
             logging.exception("housekeeping")
