@@ -8,7 +8,7 @@ from aiogram.types import BotCommand
 
 import config
 import db
-from handlers import matches, play, reg, tourney
+from handlers import guide, matches, play, reg, tourney
 
 
 async def main():
@@ -21,10 +21,11 @@ async def main():
 
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_routers(reg.router, play.router, matches.router, tourney.router)
+    dp.include_routers(reg.router, guide.router, play.router, matches.router, tourney.router)
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать / главное меню"),
-        BotCommand(command="help", description="Как пользоваться ботом"),
+        BotCommand(command="help", description="Инструкция: как играть, вести счёт, турнир"),
+        BotCommand(command="verify", description="Верификация: фото пропуска или своё фото"),
         BotCommand(command="qr", description="QR-код, чтобы позвать коллег"),
         BotCommand(command="admin", description="Команды админа"),
     ])
