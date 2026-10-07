@@ -26,6 +26,10 @@ STATUSES = {
 }
 
 
+WORK_NOTICE = ("💼 Разработчики не поддерживают игру в теннис во время работы, только после её окончания. "
+               "Работа — в приоритете!")
+
+
 def main_kb() -> ReplyKeyboardMarkup:
     rows = [[B_STATUS, B_WHO], [B_TABLE, B_STAND], [B_MY, B_LIVE], [B_RES, B_PROF]]
     return ReplyKeyboardMarkup(
