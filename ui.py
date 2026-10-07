@@ -45,7 +45,9 @@ def esc(s) -> str:
 
 
 def name(u: dict | None) -> str:
-    return esc(u["name"]) if u else "?"
+    if not u:
+        return "?"
+    return esc(u["name"]) + (" ☑️" if u.get("verified") == 1 else "")
 
 
 def full(u: dict) -> str:
@@ -113,5 +115,14 @@ def profile_text(u: dict) -> str:
         f"Уровень: {logic.LEVELS.get(u['level'], '—')}\n"
         f"Рейтинг посева: {u['seed']}\n"
         f"Лига: {league_name(u['league'])}\n"
-        f"Турнир: {'участвую' if u['wants_tournament'] else 'только дружеские игры'}"
+        f"Турнир: {'участвую' if u['wants_tournament'] else 'только дружеские игры'}\n"
+        f"Верификация: {VERIFY_STATUS.get(u.get('verified') or 0)}"
     )
+
+
+VERIFY_STATUS = {
+    0: "не пройдена (необязательно) — /verify",
+    1: "☑️ подтверждён",
+    2: "⏳ на проверке у админа",
+    -1: "❌ отклонена — можно отправить заново: /verify",
+}

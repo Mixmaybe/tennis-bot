@@ -76,6 +76,13 @@ async def init(path: str):
     DB = await aiosqlite.connect(path)
     DB.row_factory = aiosqlite.Row
     await DB.executescript(SCHEMA)
+    # миграции: новые колонки для старых баз
+    async with DB.execute("PRAGMA table_info(users)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    for col, ddl in [("verified", "INTEGER DEFAULT 0"),  # 0 нет, 1 подтверждён, -1 отклонён, 2 на проверке
+                     ("verify_photo", "TEXT"), ("verify_kind", "TEXT")]:
+        if col not in cols:
+            await DB.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
     for n in range(1, config.TABLES + 1):
         await DB.execute("INSERT OR IGNORE INTO tables(table_no) VALUES (?)", (n,))
     await DB.commit()
